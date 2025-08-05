@@ -1,147 +1,232 @@
-import os
-import json
-import re
+import os, re, json, time, logging
+from typing import List, Dict, Any, Optional
+import concurrent.futures
+import functools
 import google.generativeai as genai
+from urllib.parse import urlparse
 from dotenv import load_dotenv
 
-# Load API key
+from .tools import (
+    run_ddg_search,
+    google_search,
+    wiki_tool,
+    scrape_url,
+    extract_article,
+    save_to_txt
+)
+
 load_dotenv()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 if not GEMINI_API_KEY:
     raise ValueError("GEMINI_API_KEY is missing")
-
 genai.configure(api_key=GEMINI_API_KEY)
 
+# setup logger
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+handler = logging.StreamHandler()
+formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+handler.setFormatter(formatter)
+logger.addHandler(handler)
+
+# configurable models & temps
+MODELS = {
+    'local': ('gemini-2.0-flash', 0.0),
+    'world': ('gemini-2.0-flash', 0.0),
+    'web':   ('gemini-2.5-pro',   0.0),
+    'merge': ('gemini-2.5-pro',   0.2),
+}
+
+@functools.lru_cache(maxsize=128)
+def _cached_scrape(url: str) -> str:
+    return scrape_url(url)
+
+def retry(max_attempts=3, delay: float = 1.0):
+    def deco(func):
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            for attempt in range(max_attempts):
+                try:
+                    return func(*args, **kwargs)
+                except Exception as e:
+                    logger.warning(f"Attempt {attempt+1} failed for {func.__name__}: {e}")
+                    time.sleep(delay)
+            return ""
+        return wrapper
+    return deco
+
+scrape_with_retry = retry()(_cached_scrape)
+
+def _call_llm(stage: str, prompt: str) -> Any:
+    model_name, temp = MODELS.get(stage, MODELS['world'])
+    llm = genai.GenerativeModel(model_name)
+    prompt += "\n\nInstructions: Append inline citations like (Source: ...) where relevant."
+    resp = llm.generate_content(prompt, generation_config={"temperature": temp})
+    text = resp.text.strip()
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        return {"answer": text}
+
+def is_valid_url(u: str) -> bool:
+    p = urlparse(u)
+    return p.scheme in ("http", "https") and bool(p.netloc)
 
 class ResearchAgent:
     def __init__(self, indexer):
         self.indexer = indexer
-        self.cache = {}
 
-    def generate_report(self, query: str, mode: str = "normal") -> dict:
-        print(f"🔁 Mode: {mode}")
+    def generate_report(self, query: str, mode: str = "normal") -> Dict[str, Any]:
+        start_time = time.time()
+        mode = (mode or "normal").lower()
+        logger.info(f"Generating report for '{query}' in {mode} mode")
 
-        if mode == "deep":
-            model_name = "gemini-2.5-pro"
-            prompt_style = "detailed"
+        # override via flags
+        if query.startswith("wiki:"):
+            mode = "deep"
+            query = query[len("wiki:"):].strip()
+        elif query.startswith("news:"):
+            mode = "deep"
+            query = query[len("news:"):].strip()
+
+        # 1) LOCAL context
+        raw_results = self.indexer.search(query) or []
+        chunks: List[str] = []
+        for item in raw_results:
+            if isinstance(item, dict):
+                text, score = item.get('text',''), item.get('score',0)
+            elif isinstance(item, tuple):
+                text, score = item[0], item[1]
+            else:
+                text, score = str(item), 1.0
+            if score < 0.1:
+                break
+            chunks.append(text)
+        local_text = "\n".join(chunks)
+
+        local_prompt = json.dumps({
+            "source": "local",
+            "query": query,
+            "context": local_text,
+            "instructions": "Answer only from LOCAL context, extremely concise. If not found, return {\"answer\": null}. No filler."
+        })
+        local_future = concurrent.futures.ThreadPoolExecutor().submit(
+            _call_llm, 'local', local_prompt
+        )
+
+        # 2) WORLD or DEEP
+        if mode == "normal":
+            world_prompt = json.dumps({
+                "source": "world",
+                "query": query,
+                "instructions": "Use ONLY your internal knowledge, be extremely concise, and always provide an answer—even if it wasn’t in your LOCAL context."
+            })
+            other_future = concurrent.futures.ThreadPoolExecutor().submit(
+                _call_llm, 'world', world_prompt
+            )
+            web_urls: List[str] = []
         else:
-            model_name = "gemini-2.0-flash"
-            prompt_style = "fast"
+            raw_res = google_search(query, max_results=5) or ""
+            if not raw_res.strip():
+                raw_res = run_ddg_search(query, max_results=5)
+            lines = raw_res.splitlines()
 
-        llm = genai.GenerativeModel(model_name)
+            web_urls: List[str] = []
+            for line in lines:
+                if ": http" not in line:
+                    continue
+                _, candidate = line.rsplit(": ", 1)
+                if is_valid_url(candidate):
+                    web_urls.append(candidate)
+                if len(web_urls) >= 5:
+                    break
 
-        if query in self.cache:
-            print("⚡ Using cached full response")
-            return self.cache[query]
+            texts, sources = [], []
+            with concurrent.futures.ThreadPoolExecutor(max_workers=4) as exe:
+                futures = {exe.submit(scrape_with_retry, url): url for url in web_urls}
+                for fut in concurrent.futures.as_completed(futures):
+                    url = futures[fut]
+                    txt = fut.result()
+                    if not txt:
+                        continue
+                    try:
+                        art = extract_article(url)
+                        sources.append({
+                            "name": art['title'],
+                            "url": url,
+                            "meta": {
+                                "authors": art['authors'],
+                                "date": art['publish_date']
+                            }
+                        })
+                        texts.append(art['summary'])
+                    except Exception:
+                        sources.append({"name": url, "url": url})
+                        texts.append(txt)
 
-        local_context = self.indexer.search(query)
-        local_text = "\n".join(local_context) if local_context else "[No local documents found]"
+            wiki_snip = wiki_tool.run(query) or ""
+            web_text = "\n".join([wiki_snip] + texts)
+            web_prompt = json.dumps({
+                "source": "web",
+                "query": query,
+                "instructions": "Answer ONLY from the WEB context, be extremely concise, and always provide an answer—even if it wasn’t in your scraped pages."
+            })
+            other_future = concurrent.futures.ThreadPoolExecutor().submit(
+                _call_llm, 'web', web_prompt
+            )
 
-        tools_used = ["local_index"]
-        web_parts = []
+        local_ans = local_future.result()
+        other_ans = other_future.result()
 
-        # Local Summary
-        local_prompt = f"""
-        You are a precise research assistant. Summarize the following LOCAL context in **medium length**
-        while keeping all key facts intact. Use simple language and avoid extra details or filler text.
+        def extract(a: Any) -> Optional[str]:
+            if isinstance(a, dict):
+                return a.get('answer')
+            if isinstance(a, str):
+                return a.strip()
+            return None
 
-        Return only in JSON:
+        la, oa = extract(local_ans), extract(other_ans)
 
-        {{
-          "topic": "{query}",
-          "summary": "very concise summary based ONLY on local context",
-          "sources": [],
-          "tools_used": ["local_index"]
-        }}
+        if la and len(la) > 50:
+            final, chosen = la, 'local'
+        elif la:
+            final, chosen = la, 'local'
+        elif oa:
+            final, chosen = oa, ('world' if mode=='normal' else 'web')
+        else:
+            merge_prompt = json.dumps({
+                "stage": "merge",
+                "query": query,
+                "answers": {"local": la, "other": oa},
+                "instructions": "Merge both into one concise answer. If both null, return {\"answer\": null}."
+            })
+            merged = _call_llm('merge', merge_prompt)
+            final, chosen = extract(merged), 'merged'
 
-        Local Context:
-        {local_text}
-        """
+        if not final:
+            final, chosen = "I don't have enough info.", 'none'
 
-        try:
-            local_summary_raw = llm.generate_content(local_prompt).text
-            match = re.search(r"```json\s*(\{.*?\})\s*```", local_summary_raw, re.DOTALL)
-            local_summary_clean = match.group(1) if match else local_summary_raw
-            local_summary = json.loads(local_summary_clean)
-        except Exception as e:
-            local_summary = {
-                "topic": query,
-                "summary": "[Error generating local summary]",
-                "sources": [],
-                "tools_used": ["local_index"],
-                "error": str(e)
-            }
+        result_sources: List[Dict[str, Optional[str]]] = [{"name": "Local database", "url": None}]
+        if mode == "normal":
+            result_sources.append({"name": "Internal LLM knowledge", "url": None})
+        else:
+            wiki_url = getattr(wiki_tool, 'url', None)
+            if wiki_url:
+                result_sources.append({"name": "Wikipedia", "url": wiki_url})
+            for src in sources:
+                result_sources.append(src)
 
-        # Model (default) Summary
-        default_prompt = f"""
-        You are a {prompt_style} research assistant. Respond in the following JSON format only:
+        save_to_txt(final)
 
-        {{
-          "topic": "the topic string",
-          "summary": "a concise and insightful explanation of the topic",
-          "sources": [],
-          "tools_used": []
-        }}
+        duration = round(time.time() - start_time, 2)
+        logger.info(f"Report done in {duration}s, source={chosen}")
 
-        Topic: {query}
-        """
-
-        try:
-            response = llm.generate_content(default_prompt)
-            raw = response.text if hasattr(response, "text") else ""
-            match = re.search(r"```json\s*(\{.*?\})\s*```", raw, re.DOTALL)
-            default_clean = match.group(1) if match else raw
-            model_summary = json.loads(default_clean)
-        except Exception as e:
-            model_summary = {
-                "topic": query,
-                "summary": "Failed to generate a default model response.",
-                "sources": [],
-                "tools_used": [],
-                "error": str(e)
-            }
-
-        # Final Merge using Decision Prompt
-        decision_prompt = f"""
-        You are an evaluator comparing two summaries for the topic "{query}".
-
-        Local Summary:
-        {local_summary['summary']}
-
-        Model Summary:
-        {model_summary['summary']}
-
-        Rules:
-        1. If the local summary contains user-provided facts or direct context, always prefer the LOCAL summary.
-        2. Only merge model if it adds missing info without overriding local facts.
-        3. If the local summary alone answers the query, use it and discard the model summary.
-        4. Keep the answer concise and return in JSON format only.
-
-        Return JSON ONLY:
-
-        {{
-          "topic": "{query}",
-          "summary": "final combined or selected answer",
-          "sources": [],
-          "tools_used": []
-        }}
-        """
-
-        try:
-            decision_response = llm.generate_content(decision_prompt)
-            raw = decision_response.text if hasattr(decision_response, "text") else ""
-            match = re.search(r"```json\s*(\{.*?\})\s*```", raw, re.DOTALL)
-            clean = match.group(1) if match else raw
-            final_output = json.loads(clean)
-            final_output["tools_used"] = tools_used
-            self.cache[query] = final_output
-            return final_output
-
-        except Exception as e:
-            return {
-                "topic": query,
-                "summary": "Failed to generate final merged summary.",
-                "sources": [],
-                "tools_used": tools_used,
-                "error": str(e)
-            }
+        return {
+            "topic": query,
+            "summary": final,
+            "mode": mode,
+            "chosen_source": chosen,
+            "latency_s": duration,
+            "ask_verbose": True,
+            "sources": result_sources
+        }
